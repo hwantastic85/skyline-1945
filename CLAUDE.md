@@ -14,6 +14,8 @@
 - **화면 디자인(Design 캔버스):** https://claude.ai/artifact/CEFukj1mEMyKEVX3Gt1XKk
   - 아트 디렉션 스타일 가이드, 기체 스프라이트 컴포넌트, 핵심 화면 5개(타이틀, 인게임 보스전, 기체 선택, 격납고, 결산).
   - 같은 캔버스를 계속 고친다. 사용자가 캔버스에서 직접 고쳤을 수 있으니 수정 전에 해당 파일을 읽는다.
+- **GitHub 저장소(공개):** https://github.com/hwantastic85/skyline-1945 — 참고 스크린샷(이미지 파일)은 `.gitignore`로 빼 두었다. 공개 저장소이니 저작권 있는 이미지를 올리지 않는다.
+- **플레이 링크(Vercel):** https://skyline-1945.vercel.app — `game/` 폴더에서 `vercel deploy --prod`로 다시 배포한다.
 - **버려진 초안:** https://claude.ai/artifact/L6dQfKSfukmR97rtMaQhVv. 처음 요청한 "1984" PRD로, 개요만 쓰여 있다. 삭제할지는 아직 정하지 않았다. 사용자가 확인하기 전에는 지우지 않는다.
 
 ## 확정된 방향
