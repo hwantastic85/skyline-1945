@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SKYLINE 1945 프로토타입</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #14181E; color: #EFE4C8; font-family: system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
+  canvas { image-rendering: pixelated; outline: 2px solid #1E2733; }
+  p { margin: 0; font-size: 13px; color: #C9C4B4; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="320" height="480"></canvas>
+<p>이동 방향키·WASD · 사격 Z · 폭탄 X · 저속 Shift · 벤치마크 B · 재시작 R</p>
+<script>
+'use strict';
+// SKYLINE 1945 — 1주차 프로토타입 (F-01 이동·사격·폭탄 + 적탄 1,000발 벤치마크)
+// 파일 하나로 끝나는 HTML5 캔버스 버전. 브라우저로 열면 바로 실행된다.
+
+const W = 320, H = 480, TAU = Math.PI * 2;
+const STEP_MS = 1000 / 60;          // 로직은 60Hz 고정
+const BENCH_TARGET = 1000;
+const PAL = {
+  cream: '#EFE4C8', olive: '#7D7A45', rust: '#A8432F', ink: '#1E2733',
+  sky: '#8FA9B0', cloud: '#A9BDBE', steel: '#646C78', steelDark: '#3C424C',
+  amber: '#F2C14E', amberOut: '#7A4A10',
+  pink: '#FF3FA0', core: '#FFE1F0', out: '#2A0A1A',
+  violet: '#A64DFF', coreV: '#EBD9FF', outV: '#1A0A2A',
+};
+
+// ---------- 시드 고정 난수 (같은 입력 → 같은 결과, 리플레이 대비) ----------
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---------- 입력 ----------
+const ACTIONS = {
+  left: ['ArrowLeft', 'KeyA'], right: ['ArrowRight', 'KeyD'],
+  up: ['ArrowUp', 'KeyW'], down: ['ArrowDown', 'KeyS'],
+  shoot: ['KeyZ', 'KeyJ'], bomb: ['KeyX', 'KeyK'],
+  focus: ['ShiftLeft', 'ShiftRight'], bench: ['KeyB', 'F2'], restart: ['KeyR'],
+};
+const PAD = { shoot: 0, bomb: 1, focus: 5, restart: 9, up: 12, down: 13, left: 14, right: 15 };
+const held = new Set();
+const tapped = new Set();   // 다음 로직 프레임이 소비할 때까지 남겨 둔다(짧은 탭도 놓치지 않게)
+let padPrev = [];
+addEventListener('keydown', (e) => {
+  if (!e.repeat) tapped.add(e.code);
+  held.add(e.code);
+  if (e.code.startsWith('Arrow') || e.code === 'Space' || e.code === 'F2') e.preventDefault();
+});
+addEventListener('keyup', (e) => held.delete(e.code));
+addEventListener('blur', () => held.clear());
+
+const input = { left: false, right: false, up: false, down: false, shoot: false, focus: false, ax: 0, ay: 0, just: new Set() };
+function readInput() {
+  for (const a of ['left', 'right', 'up', 'down', 'shoot', 'focus']) input[a] = ACTIONS[a].some((c) => held.has(c));
+  input.just.clear();
+  for (const [a, codes] of Object.entries(ACTIONS)) if (codes.some((c) => tapped.has(c))) input.just.add(a);
+  tapped.clear();
+  input.ax = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  input.ay = (input.down ? 1 : 0) - (input.up ? 1 : 0);
+  const gp = navigator.getGamepads ? navigator.getGamepads()[0] : null;
+  if (gp) {
+    const b = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+    const dz = (v) => (Math.abs(v) < 0.25 ? 0 : v);
+    input.ax = Math.max(-1, Math.min(1, input.ax + dz(gp.axes[0] || 0) + (b(PAD.right) ? 1 : 0) - (b(PAD.left) ? 1 : 0)));
+    input.ay = Math.max(-1, Math.min(1, input.ay + dz(gp.axes[1] || 0) + (b(PAD.down) ? 1 : 0) - (b(PAD.up) ? 1 : 0)));
+    input.shoot ||= b(PAD.shoot);
+    input.focus ||= b(PAD.focus);
+    for (const a of ['bomb', 'restart']) if (b(PAD[a]) && !padPrev[PAD[a]]) input.just.add(a);
+    padPrev = gp.buttons.map((x) => x.pressed);
+  }
+  // 대각선도 같은 속도
+  const len = Math.hypot(input.ax, input.ay);
+  if (len > 1) { input.ax /= len; input.ay /= len; }
+}
+
+// ---------- 적탄 풀: 객체를 만들지 않고 고정 크기 배열로만 관리 ----------
+const MAX_BULLETS = 2048;
+const ORB = 0, RICE = 1;
+const HIT_R = [2.5, 2.0];          // 보이는 크기(5px, 4px)보다 작게 판정
+const bullets = {
+  x: new Float32Array(MAX_BULLETS), y: new Float32Array(MAX_BULLETS),
+  vx: new Float32Array(MAX_BULLETS), vy: new Float32Array(MAX_BULLETS),
+  k: new Uint8Array(MAX_BULLETS), count: 0,
+  spawn(x, y, vx, vy, k) {
+    if (this.count >= MAX_BULLETS) return;
+    const i = this.count++;
+    this.x[i] = x; this.y[i] = y; this.vx[i] = vx; this.vy[i] = vy; this.k[i] = k;
+  },
+  remove(i) {
+    const j = --this.count;
+    this.x[i] = this.x[j]; this.y[i] = this.y[j]; this.vx[i] = this.vx[j]; this.vy[i] = this.vy[j]; this.k[i] = this.k[j];
+  },
+  step() {
+    let i = 0;
+    while (i < this.count) {
+      const x = this.x[i] + this.vx[i], y = this.y[i] + this.vy[i];
+      if (x < -16 || x > W + 16 || y < -16 || y > H + 16) { this.remove(i); continue; }
+      this.x[i] = x; this.y[i] = y; i++;
+    }
+  },
+  hits(cx, cy, r) {
+    for (let i = 0; i < this.count; i++) {
+      const dx = this.x[i] - cx, dy = this.y[i] - cy, rr = r + HIT_R[this.k[i]];
+      if (dx * dx + dy * dy < rr * rr) return true;
+    }
+    return false;
+  },
+  clear() { const n = this.count; this.count = 0; return n; },
+  draw(g) {
+    // 색 한 겹마다 경로 하나로 모아 그린다 → 1,000발이어도 fill/stroke 6번
+    const layer = (kind, fn, style) => {
+      g.beginPath();
+      for (let i = 0; i < this.count; i++) if (this.k[i] === kind) fn(i);
+      if (kind === ORB) { g.fillStyle = style; g.fill(); } else { g.strokeStyle = style; g.stroke(); }
+    };
+    for (const [r, c] of [[5, PAL.out], [4, PAL.pink], [2, PAL.core]]) {
+      layer(ORB, (i) => { g.moveTo(this.x[i] + r, this.y[i]); g.arc(this.x[i], this.y[i], r, 0, TAU); }, c);
+    }
+    g.lineCap = 'round';
+    for (const [w, c, s] of [[6, PAL.outV, 4], [4, PAL.violet, 4], [2, PAL.coreV, 2]]) {
+      g.lineWidth = w;
+      layer(RICE, (i) => {
+        const l = Math.hypot(this.vx[i], this.vy[i]) || 1, dx = this.vx[i] / l * s, dy = this.vy[i] / l * s;
+        g.moveTo(this.x[i] - dx, this.y[i] - dy); g.lineTo(this.x[i] + dx, this.y[i] + dy);
+      }, c);
+    }
+  },
+};
+
+// ---------- 아군탄 풀 ----------
+const MAX_SHOTS = 256, SHOT_SPEED = 10;
+const shots = {
+  x: new Float32Array(MAX_SHOTS), y: new Float32Array(MAX_SHOTS), count: 0,
+  spawn(x, y) { if (this.count < MAX_SHOTS) { this.x[this.count] = x; this.y[this.count++] = y; } },
+  remove(i) { const j = --this.count; this.x[i] = this.x[j]; this.y[i] = this.y[j]; },
+  step() {
+    let i = 0;
+    while (i < this.count) { this.y[i] -= SHOT_SPEED; if (this.y[i] < -12) this.remove(i); else i++; }
+  },
+  hitRect(rx, ry, rw, rh) {
+    let n = 0, i = 0;
+    while (i < this.count) {
+      if (this.x[i] >= rx && this.x[i] <= rx + rw && this.y[i] >= ry && this.y[i] <= ry + rh) { this.remove(i); n++; } else i++;
+    }
+    return n;
+  },
+  draw(g) {
+    g.fillStyle = PAL.amberOut;
+    for (let i = 0; i < this.count; i++) g.fillRect(this.x[i] - 2, this.y[i] - 6, 4, 12);
+    g.fillStyle = PAL.amber;
+    for (let i = 0; i < this.count; i++) g.fillRect(this.x[i] - 1, this.y[i] - 5, 2, 10);
+  },
+};
+
+// ---------- 플레이어(팔콘) ----------
+const P = {
+  SPEED: 3, FOCUS_SPEED: 1.5, HITBOX_R: 2, FIRE_INTERVAL: 4,
+  BOMB_FRAMES: 90, BOMB_CLEAR_FRAMES: 30, RESPAWN_INVULN: 120, START_BOMBS: 3,
+};
+// 디자인 캔버스의 팔콘 32×32 도트와 같은 그림. [x, y, w, h, 색]
+const FALCON = [
+  [12, 2, 8, 1, 'ink'], [14, 3, 4, 4, 'rust'], [14, 7, 4, 20, 'cream'], [13, 8, 1, 18, 'ink'],
+  [18, 8, 1, 18, 'ink'], [15, 9, 2, 4, 'ink'], [3, 12, 26, 5, 'olive'], [3, 17, 26, 1, 'ink'],
+  [2, 13, 1, 4, 'ink'], [29, 13, 1, 4, 'ink'], [6, 13, 3, 3, 'cream'], [7, 14, 1, 1, 'rust'],
+  [23, 13, 3, 3, 'cream'], [24, 14, 1, 1, 'rust'], [10, 24, 12, 3, 'olive'], [10, 27, 12, 1, 'ink'],
+  [15, 27, 2, 3, 'rust'],
+];
+const falconSprite = (() => {
+  const c = document.createElement('canvas'); c.width = 32; c.height = 32;
+  const g = c.getContext('2d');
+  for (const [x, y, w, h, col] of FALCON) { g.fillStyle = PAL[col]; g.fillRect(x, y, w, h); }
+  return c;
+})();
+
+// ---------- 게임 상태 ----------
+let S;
+function reset() {
+  const rng = makeRng(1945);
+  S = {
+    rng, frame: 0, score: 0, bench: false, gameOver: false, bombWave: -1,
+    player: { x: W / 2, y: H - 60, lives: 2, bombs: P.START_BOMBS, invuln: 0, bombTimer: 0, cooldown: 0, focused: false, dead: false, god: false },
+    enemy: { x: W / 2, y: 72, hp: 300, t: 0, flash: 0, active: true },
+    clouds: Array.from({ length: 10 }, () => [rng() * (W + 40) - 40, rng() * H, 40 + rng() * 70, 6 + rng() * 10]),
+  };
+  bullets.clear(); shots.count = 0;
+}
+
+function stepPlayer(p) {
+  if (p.dead) return;
+  if (p.invuln > 0) p.invuln--;
+  if (p.bombTimer > 0) p.bombTimer--;
+  if (p.cooldown > 0) p.cooldown--;
+  p.focused = input.focus;
+  const sp = p.focused ? P.FOCUS_SPEED : P.SPEED;
+  p.x = Math.max(10, Math.min(W - 10, p.x + input.ax * sp));
+  p.y = Math.max(14, Math.min(H - 14, p.y + input.ay * sp));
+  if (input.shoot && p.cooldown === 0) {
+    shots.spawn(p.x - 4, p.y - 12); shots.spawn(p.x + 4, p.y - 12);
+    p.cooldown = P.FIRE_INTERVAL;
+  }
+  if (input.just.has('bomb') && p.bombs > 0 && p.bombTimer === 0) {
+    p.bombs--; p.bombTimer = P.BOMB_FRAMES; p.invuln = Math.max(p.invuln, P.BOMB_FRAMES);
+    S.bombWave = 0;
+  }
+}
+
+function hitPlayer(p) {
+  p.lives--;
+  bullets.clear();
+  if (p.lives < 0) { p.dead = true; S.gameOver = true; S.enemy.active = false; return; }
+  p.x = W / 2; p.y = H - 40; p.invuln = P.RESPAWN_INVULN; p.bombs = Math.max(p.bombs, P.START_BOMBS);
+}
+
+// 훈련 표적기: 좌우로 오가며 핑크 고리탄 + 보라 조준 부채탄
+function stepEnemy(e, p) {
+  e.t++;
+  if (e.flash > 0) e.flash--;
+  e.x = W / 2 + Math.sin(e.t * 0.02) * 90;
+  if (!e.active) return;
+  if (e.t % 48 === 0) {
+    const n = 18, off = e.t * 0.05;
+    for (let i = 0; i < n; i++) { const a = off + TAU * i / n; bullets.spawn(e.x, e.y + 10, Math.cos(a) * 1.4, Math.sin(a) * 1.4, ORB); }
+  }
+  if (e.t % 30 === 15 && !p.dead) {
+    const ox = e.x, oy = e.y + 12, base = Math.atan2(p.y - oy, p.x - ox);
+    for (let i = 0; i < 5; i++) { const a = base + (i - 2) * 0.18; bullets.spawn(ox, oy, Math.cos(a) * 2.2, Math.sin(a) * 2.2, RICE); }
+  }
+}
+
+function benchFill() {
+  const r = S.rng;
+  while (bullets.count < BENCH_TARGET) {
+    const a = r() * TAU, sp = 0.5 + r() * 1.5;
+    bullets.spawn(r() * W, r() * H, Math.cos(a) * sp, Math.sin(a) * sp, r() < 0.5 ? ORB : RICE);
+  }
+}
+
+// 로직 한 프레임. 처리 순서를 고정한다: 입력·플레이어 → 아군탄 → 적 → 벤치 보충 → 적탄 → 판정
+function step() {
+  readInput();
+  if (input.just.has('restart')) { reset(); return; }
+  if (input.just.has('bench')) {
+    S.bench = !S.bench; S.enemy.active = !S.bench && !S.gameOver; S.player.god = S.bench;
+    bullets.clear(); perf.stepMax = 0;
+  }
+  S.frame++;
+  const p = S.player, e = S.enemy;
+  stepPlayer(p);
+  shots.step();
+  stepEnemy(e, p);
+  if (S.bench) benchFill();
+  bullets.step();
+
+  const n = shots.hitRect(e.x - 36, e.y - 14, 72, 28);
+  if (n) {
+    e.hp -= n; e.flash = 2; S.score += n * 10;
+    if (e.hp <= 0) { e.hp = 300; S.score += 10000; }
+  }
+  const clearing = p.bombTimer > P.BOMB_FRAMES - P.BOMB_CLEAR_FRAMES;
+  if (clearing) S.score += bullets.clear() * 5;
+  else if (!p.god && !p.dead && p.invuln === 0 && bullets.hits(p.x, p.y, P.HITBOX_R)) hitPlayer(p);
+
+  for (const c of S.clouds) { c[1] += 0.6; if (c[1] > H) { c[0] = S.rng() * (W + 40) - 40; c[1] = -c[3]; } }
+  if (S.bombWave >= 0) { S.bombWave += 8; if (S.bombWave > 600) S.bombWave = -1; }
+}
+
+// ---------- 그리기 ----------
+const cv = document.getElementById('screen');
+const g = cv.getContext('2d');
+
+function drawEnemy(e) {
+  const body = e.flash > 0 ? '#FFFFFF' : PAL.steel;
+  const r = (x, y, w, h, c) => { g.fillStyle = c; g.fillRect(e.x + x, e.y + y, w, h); };
+  r(-36, -6, 72, 10, PAL.steelDark); r(-35, -5, 70, 8, body);               // 주익
+  for (const x of [-26, -16, 16, 26]) { r(x - 2, -10, 4, 13, PAL.steelDark); r(x - 3, -11, 6, 1, PAL.cream); }
+  r(-8, -14, 16, 28, PAL.steelDark); r(-7, -13, 14, 26, body);              // 동체
+  r(-4, 4, 8, 8, PAL.rust); r(-1, 10, 2, 4, PAL.ink);                       // 포탑
+  r(-30, -2, 8, 2, PAL.out); r(22, -2, 8, 2, PAL.out);                      // 그라우 제국 관측창 표지
+}
+
+function drawPlayer(p) {
+  if (p.dead) return;
+  const blink = p.invuln > 0 && S.frame % 6 < 3;
+  if (!blink) g.drawImage(falconSprite, Math.round(p.x) - 16, Math.round(p.y) - 15);
+  if (p.focused) {
+    for (const [r, c] of [[4, PAL.pink], [3, PAL.ink], [P.HITBOX_R, '#FFFFFF']]) {
+      g.beginPath(); g.arc(p.x, p.y, r, 0, TAU); g.fillStyle = c; g.fill();
+    }
+  }
+}
+
+function text(str, x, y, color = PAL.cream, align = 'left', size = 10) {
+  g.font = `bold ${size}px ui-monospace, Menlo, monospace`;
+  g.textAlign = align;
+  g.fillStyle = PAL.ink; g.fillText(str, x + 1, y + 1);
+  g.fillStyle = color; g.fillText(str, x, y);
+}
+
+function draw() {
+  g.fillStyle = PAL.sky; g.fillRect(0, 0, W, H);
+  g.fillStyle = PAL.cloud;
+  for (const [x, y, w, h] of S.clouds) g.fillRect(Math.round(x), Math.round(y), w | 0, h | 0);
+  if (S.bombWave >= 0) {
+    g.lineWidth = 4; g.strokeStyle = PAL.amber; g.beginPath(); g.arc(S.player.x, S.player.y, S.bombWave, 0, TAU); g.stroke();
+    g.lineWidth = 2; g.strokeStyle = PAL.cream; g.beginPath(); g.arc(S.player.x, S.player.y, S.bombWave * 0.7, 0, TAU); g.stroke();
+  }
+  drawEnemy(S.enemy);
+  shots.draw(g);
+  drawPlayer(S.player);
+  bullets.draw(g);   // 적탄은 맨 위: 무엇에도 가려지지 않게
+
+  text(`1P ${String(S.score).padStart(8, '0')}`, 6, 14);
+  text(`BOSS ${S.enemy.hp}`, W - 6, 14, PAL.cream, 'right');
+  text(`LIFE ${Math.max(S.player.lives, 0)}  BOMB ${S.player.bombs}`, 6, H - 8);
+  text(`${S.bench ? '[BENCH] ' : ''}FPS ${perf.fps.toFixed(0)}  BULLETS ${bullets.count}  LOGIC ${perf.stepAvg.toFixed(2)}ms (max ${perf.stepMax.toFixed(2)})`,
+    W - 6, 28, PAL.amber, 'right', 8);
+  if (S.gameOver) { text('GAME OVER', W / 2, H / 2, PAL.cream, 'center', 20); text('PRESS R', W / 2, H / 2 + 20, PAL.cream, 'center', 12); }
+}
+
+// ---------- 고정 타임스텝 루프 ----------
+const perf = { fps: 60, stepAvg: 0, stepMax: 0, frames: 0, last: performance.now(), fpsT: performance.now() };
+let acc = 0;
+function loop(now) {
+  acc += Math.min(now - perf.last, 250);
+  perf.last = now;
+  let steps = 0;
+  while (acc >= STEP_MS && steps < 8) {
+    const t0 = performance.now();
+    step();
+    const dt = performance.now() - t0;
+    perf.stepAvg = perf.stepAvg * 0.95 + dt * 0.05;
+    if (S.frame > 2) perf.stepMax = Math.max(perf.stepMax, dt);
+    acc -= STEP_MS; steps++;
+  }
+  if (steps === 8) acc = 0;
+  draw();
+  perf.frames++;
+  if (now - perf.fpsT >= 500) { perf.fps = perf.frames * 1000 / (now - perf.fpsT); perf.frames = 0; perf.fpsT = now; }
+  requestAnimationFrame(loop);
+}
+
+function fit() {
+  const s = Math.max(1, Math.floor(Math.min(innerWidth / W, (innerHeight - 40) / H)));
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+}
+addEventListener('resize', fit);
+fit();
+reset();
+requestAnimationFrame(loop);
+
+// 개발용: 콘솔에서 game.state, game.bullets로 들여다본다
+window.game = { get state() { return S; }, bullets, shots, perf, step, draw, reset };
+</script>
+</body>
+</html>

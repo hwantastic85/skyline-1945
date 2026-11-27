@@ -1,0 +1,8 @@
+# 참고용 기존 게임 스크린샷: 저작권이 있으니 저장소에 올리지 않는다
+*.jpeg
+*.jpg
+*.png
+*.webp
+
+.DS_Store
+.vercel
