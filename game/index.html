@@ -2,18 +2,33 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#14181E">
 <title>SKYLINE 1945 프로토타입</title>
 <style>
   html, body { margin: 0; height: 100%; background: #14181E; color: #EFE4C8; font-family: system-ui, sans-serif; }
   body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; }
-  canvas { image-rendering: pixelated; outline: 2px solid #1E2733; }
+  canvas { image-rendering: pixelated; outline: 2px solid #1E2733; touch-action: none; }
   p { margin: 0; font-size: 13px; color: #C9C4B4; text-align: center; }
+  #bomb { display: none; }
+  body.touch { height: 100dvh; gap: 0; overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; }
+  body.touch p { display: none; }
+  body.touch canvas { outline: none; }
+  body.touch #bomb {
+    display: flex; align-items: center; justify-content: center;
+    position: fixed; right: 16px; bottom: calc(20px + env(safe-area-inset-bottom));
+    width: 72px; height: 72px; border-radius: 50%;
+    background: rgba(168, 67, 47, 0.85); color: #EFE4C8; border: 3px solid #EFE4C8;
+    font: bold 16px system-ui, sans-serif; touch-action: none;
+  }
+  body.touch #bomb:active { background: #F2C14E; color: #1E2733; }
 </style>
 </head>
 <body>
 <canvas id="screen" width="320" height="480"></canvas>
 <p>이동 방향키·WASD · 사격 Z · 폭탄 X · 저속 Shift · 벤치마크 B · 재시작 R</p>
+<button id="bomb" type="button" aria-label="폭탄">폭탄</button>
 <script>
 'use strict';
 // SKYLINE 1945 — 1주차 프로토타입 (F-01 이동·사격·폭탄 + 적탄 1,000발 벤치마크)
@@ -61,12 +76,22 @@ addEventListener('keydown', (e) => {
 addEventListener('keyup', (e) => held.delete(e.code));
 addEventListener('blur', () => held.clear());
 
+// 터치(PRD 모바일 조작): 화면 아무 데나 대고 끌면 손가락이 움직인 만큼 기체가 움직이고(상대 이동),
+// 손가락이 닿아 있는 동안 자동 사격. 폭탄은 오른쪽 아래 버튼. 리스너는 아래 그리기 부분에서 붙인다.
+let IS_TOUCH = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+const TOUCH_GAIN = 1.2;
+const touch = { id: null, down: false, dx: 0, dy: 0, lx: 0, ly: 0, bomb: false, restart: false };
+
 const input = { left: false, right: false, up: false, down: false, shoot: false, focus: false, ax: 0, ay: 0, just: new Set() };
 function readInput() {
   for (const a of ['left', 'right', 'up', 'down', 'shoot', 'focus']) input[a] = ACTIONS[a].some((c) => held.has(c));
   input.just.clear();
   for (const [a, codes] of Object.entries(ACTIONS)) if (codes.some((c) => tapped.has(c))) input.just.add(a);
   tapped.clear();
+  input.shoot ||= touch.down;
+  if (touch.bomb) input.just.add('bomb');
+  if (touch.restart) input.just.add('restart');
+  touch.bomb = touch.restart = false;
   input.ax = (input.right ? 1 : 0) - (input.left ? 1 : 0);
   input.ay = (input.down ? 1 : 0) - (input.up ? 1 : 0);
   const gp = navigator.getGamepads ? navigator.getGamepads()[0] : null;
@@ -204,8 +229,9 @@ function stepPlayer(p) {
   if (p.cooldown > 0) p.cooldown--;
   p.focused = input.focus;
   const sp = p.focused ? P.FOCUS_SPEED : P.SPEED;
-  p.x = Math.max(10, Math.min(W - 10, p.x + input.ax * sp));
-  p.y = Math.max(14, Math.min(H - 14, p.y + input.ay * sp));
+  p.x = Math.max(10, Math.min(W - 10, p.x + input.ax * sp + touch.dx));
+  p.y = Math.max(14, Math.min(H - 14, p.y + input.ay * sp + touch.dy));
+  touch.dx = touch.dy = 0;
   if (input.shoot && p.cooldown === 0) {
     shots.spawn(p.x - 4, p.y - 12); shots.spawn(p.x + 4, p.y - 12);
     p.cooldown = P.FIRE_INTERVAL;
@@ -326,7 +352,7 @@ function draw() {
   text(`LIFE ${Math.max(S.player.lives, 0)}  BOMB ${S.player.bombs}`, 6, H - 8);
   text(`${S.bench ? '[BENCH] ' : ''}FPS ${perf.fps.toFixed(0)}  BULLETS ${bullets.count}  LOGIC ${perf.stepAvg.toFixed(2)}ms (max ${perf.stepMax.toFixed(2)})`,
     W - 6, 28, PAL.amber, 'right', 8);
-  if (S.gameOver) { text('GAME OVER', W / 2, H / 2, PAL.cream, 'center', 20); text('PRESS R', W / 2, H / 2 + 20, PAL.cream, 'center', 12); }
+  if (S.gameOver) { text('GAME OVER', W / 2, H / 2, PAL.cream, 'center', 20); text(IS_TOUCH ? 'TAP TO RESTART' : 'PRESS R', W / 2, H / 2 + 20, PAL.cream, 'center', 12); }
 }
 
 // ---------- 고정 타임스텝 루프 ----------
@@ -351,8 +377,40 @@ function loop(now) {
   requestAnimationFrame(loop);
 }
 
+// ---------- 터치 입력 ----------
+cv.addEventListener('pointerdown', (e) => {
+  if (e.pointerType === 'mouse') return;
+  e.preventDefault();
+  if (S.gameOver) { touch.restart = true; return; }
+  if (touch.id !== null) return;   // 첫 손가락만 조작에 쓴다
+  touch.id = e.pointerId; touch.down = true; touch.lx = e.clientX; touch.ly = e.clientY;
+  try { cv.setPointerCapture(e.pointerId); } catch (_) { /* 캡처 실패해도 조작은 된다 */ }
+});
+cv.addEventListener('pointermove', (e) => {
+  if (e.pointerId !== touch.id) return;
+  const k = W / cv.clientWidth * TOUCH_GAIN;
+  touch.dx += (e.clientX - touch.lx) * k; touch.dy += (e.clientY - touch.ly) * k;
+  touch.lx = e.clientX; touch.ly = e.clientY;
+});
+const touchEnd = (e) => { if (e.pointerId === touch.id) { touch.id = null; touch.down = false; } };
+cv.addEventListener('pointerup', touchEnd);
+cv.addEventListener('pointercancel', touchEnd);
+const bombBtn = document.getElementById('bomb');
+bombBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); touch.bomb = true; });
+bombBtn.addEventListener('click', (e) => { if (e.detail === 0) touch.bomb = true; });   // 키보드로 누른 경우
+addEventListener('contextmenu', (e) => { if (IS_TOUCH) e.preventDefault(); });
+if (IS_TOUCH) document.body.classList.add('touch');
+// 감지가 빗나가도 첫 터치에서 터치 모드로 바꾼다
+addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'touch' || IS_TOUCH) return;
+  IS_TOUCH = true; document.body.classList.add('touch'); fit();
+}, { capture: true });
+
 function fit() {
-  const s = Math.max(1, Math.floor(Math.min(innerWidth / W, (innerHeight - 40) / H)));
+  // 폰에서는 화면에 꽉 차게(소수 배율), 데스크톱에서는 도트가 깨지지 않게 정수 배율
+  const s = IS_TOUCH
+    ? Math.min(innerWidth / W, innerHeight / H)
+    : Math.max(1, Math.floor(Math.min(innerWidth / W, (innerHeight - 40) / H)));
   cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
 }
 addEventListener('resize', fit);
